@@ -32,13 +32,36 @@ def allowed(url):
     return u.scheme == "https" and any(host == h or host.endswith("." + h) for h in ALLOW)
 
 
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    """転送先も許したホストの https だけ（最初の URL だけ確かめても、転送で別の所へ行ける）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not allowed(newurl):
+            raise ValueError("許可していないホストへの転送")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def kind(path):
+    """入れ物の形を頭のバイトで決める（mp4/mov・mkv/webm だけ）。ffmpeg に読み方を強いる＝プレイリストなどで
+    作業箱の中のファイルを読ませない（2026-10-29 点検）。"""
+    with open(path, "rb") as f:
+        head = f.read(12)
+    if head[4:8] == b"ftyp":
+        return "mov"
+    if head[:4] == bytes.fromhex("1a45dfa3"):
+        return "matroska"
+    raise ValueError("動画の入れ物（mp4・mov・mkv・webm）ではない")
+
+
 def fetch(url, out):
     if not allowed(url):
         raise ValueError(f"許可していないホスト: {url[:80]}")
-    host = url.split("/")[2]
-    if host.endswith(("cdninstagram.com", "fbcdn.net")) or url.split("?")[0].endswith(".mp4"):
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    host = (u.hostname or "").lower()
+    if host.endswith(("cdninstagram.com", "fbcdn.net")) or u.path.endswith(".mp4"):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=120) as r, open(out, "wb") as f:
+        with urllib.request.build_opener(_Redirect).open(req, timeout=120) as r, open(out, "wb") as f:
             shutil.copyfileobj(r, f)
     else:
         r = subprocess.run(["yt-dlp", "--no-warnings", "-f", "b[vcodec^=avc1]/bv*[vcodec^=avc1]/b[vcodec*=264]/b", "-S", "vcodec:h264", "--ffmpeg-location", FF, "-o", out.replace(".mp4", ".%(ext)s"), url], capture_output=True, text=True, timeout=300)
@@ -60,7 +83,7 @@ def blocks(p):
 
 def probe(p):
     import re
-    e = subprocess.run([FF, "-protocol_whitelist", "file", "-i", p], capture_output=True, text=True).stderr
+    e = subprocess.run([FF, "-protocol_whitelist", "file", "-f", kind(p), "-i", p], capture_output=True, text=True).stderr
     m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", e)
     d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", e)
     print("probe", [l.strip() for l in e.splitlines() if "Stream" in l][:3], flush=True)
@@ -72,7 +95,7 @@ def sheets(vid, path, out):
     fd = f"tmp/{vid}"
     shutil.rmtree(fd, ignore_errors=True)
     os.makedirs(fd)
-    r = subprocess.run([FF, "-v", "error", "-protocol_whitelist", "file", "-i", path, "-vf",
+    r = subprocess.run([FF, "-v", "error", "-protocol_whitelist", "file", "-f", kind(path), "-i", path, "-vf",
                         f"fps=3,scale={CW}:{CH}:force_original_aspect_ratio=decrease,pad={CW}:{CH}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p",
                         "-q:v", "3", f"{fd}/%05d.jpg"], capture_output=True, text=True)
     if r.returncode:
