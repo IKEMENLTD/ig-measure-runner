@@ -18,12 +18,13 @@ FF = imageio_ffmpeg.get_ffmpeg_exe()  # apt-get が10分止まった（2026-10-2
 CW, CH, COLS, ROWS, LAB = 312, 554, 5, 2, 20  # 高さは偶数（555 だと JPEG の書き出しが -22 で落ちた）
 PER = COLS * ROWS
 MAXF = 30
+MAXE = 60  # 決まった間隔で取る時の上限（6枚）
 VID = __import__("re").compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # 取りに行ってよいホスト（https だけ）。何でも取れる作りにしない（自動のセキュリティ確認の指摘・2026-10-23）
 ALLOW = tuple(h.strip() for h in os.environ.get(
-    "ALLOW_HOSTS", "cdninstagram.com,fbcdn.net,instagram.com,tiktok.com,tiktokcdn.com,w3schools.com").split(",") if h.strip())
+    "ALLOW_HOSTS", "cdninstagram.com,fbcdn.net,instagram.com,tiktok.com,tiktokcdn.com,w3schools.com,drive.usercontent.google.com").split(",") if h.strip())
 
 
 def allowed(url):
@@ -60,7 +61,8 @@ def fetch(url, out):
     from urllib.parse import urlparse
     u = urlparse(url)
     host = (u.hostname or "").lower()
-    if host.endswith(("cdninstagram.com", "fbcdn.net")) or u.path.endswith(".mp4"):
+    # ドライブは「リンクを知っている人は見られる」の物だけ（鍵は渡さない・2026-10-30 依頼主のインサートの台帳）
+    if host.endswith(("cdninstagram.com", "fbcdn.net", "drive.usercontent.google.com")) or u.path.endswith(".mp4"):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.build_opener(_Redirect).open(req, timeout=120) as r, open(out, "wb") as f:
             shutil.copyfileobj(r, f)
@@ -89,24 +91,29 @@ def probe(p):
             "duration": int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3)) if d else 0}
 
 
-def sheets(vid, path, out):
+def sheets(vid, path, out, every=None):
+    """every（秒）を渡すと、画の変わり目ではなく決まった間隔で取る（使える2〜3秒の所を選ぶ台帳用）。"""
     fd = f"tmp/{vid}"
     shutil.rmtree(fd, ignore_errors=True)
     os.makedirs(fd)
     r = subprocess.run([FF, "-v", "error", "-protocol_whitelist", "file", "-f", kind(path), "-i", path, "-vf",
-                        f"fps=3,scale={CW}:{CH}:force_original_aspect_ratio=decrease,pad={CW}:{CH}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p",
+                        f"fps={1 / every if every else 3},scale={CW}:{CH}:force_original_aspect_ratio=decrease,pad={CW}:{CH}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p",
                         "-q:v", "3", f"{fd}/%05d.jpg"], capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError("ffmpeg: " + r.stderr[-300:])
     fs = sorted(glob.glob(f"{fd}/*.jpg"))
     keep, prev = [], None
-    for i, f in enumerate(fs):
+    if every:  # 決まった間隔：全部残す（多すぎる時は等間隔に間引く・最大 MAXE）
+        keep = [(f, i * every, 0.0) for i, f in enumerate(fs)]
+        if len(keep) > MAXE:
+            keep = [keep[round(j * (len(keep) - 1) / (MAXE - 1))] for j in range(MAXE)]
+    for i, f in enumerate(fs if not every else []):
         b = blocks(f)
         d = 999.0 if prev is None else float(np.abs(b - prev).max())
         if d > 14:
             keep.append((f, i / 3, d))
             prev = b
-    if len(keep) > MAXF:
+    if len(keep) > MAXF and not every:
         keep = [keep[0]] + sorted(sorted(keep[1:], key=lambda k: -k[2])[:MAXF - 1], key=lambda k: k[1])
     font = ImageFont.load_default(16)
     n = 0
@@ -137,7 +144,8 @@ def main(items_p, out):
         try:
             p = fetch(url, f"v/{vid}.mp4")
             info = probe(p)
-            frames, n = sheets(vid, p, out)
+            every = it.get("every")
+            frames, n = sheets(vid, p, out, float(every) if every else None)
             info.update(frames=frames, sheets=n, secs=round(time.time() - t0, 1))
             os.remove(p)
         except Exception as e:
