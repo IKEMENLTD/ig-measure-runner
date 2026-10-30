@@ -3,33 +3,50 @@ on:
   workflow_dispatch:
     inputs:
       items:
-        description: '[{"id": "...", "url": "..."}] の JSON（URL は実行ごとに渡し、repo には残さない）'
+        description: '[{"id": "...", "url": "..."}] の JSON を BUNDLE_KEY（repo の秘密）で暗号化して base64 にした物。公開 repo の入力はログに出るので、暗号化せずに渡さない'
         required: true
       tag:
-        description: 結果の名前
+        description: 結果の名前（英数字と _ - だけ）
         required: true
         default: run
 permissions:
   contents: read
+# 2026-10-30 辛口点検：入力（調べる動画の URL）も結果（コマの絵・meta.json）も暗号にする。
+# 公開 repo のログと置き土産（artifact）は誰でも見られる＝何を調べているかも出さない。
+# 鍵は解く段と包む段にだけ渡し、外の動画を扱う段（yt-dlp・ffmpeg）には渡さない。
 jobs:
   frames:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4（2026-10-29 時点の版に固定）
         with:
           persist-credentials: false
+      - name: 入力を解く
+        env:
+          ITEMS: ${{ inputs.items }}
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || { echo "tag は英数字と _ - だけ"; exit 1; }
+          printf '%s' "$ITEMS" | base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -out "$RUNNER_TEMP/items.json"
       - name: 道具を入れる
         run: |
           pip install -q pillow numpy yt-dlp imageio-ffmpeg
       - name: コマ一覧を作る
-        env:
-          ITEMS: ${{ inputs.items }}
         run: |
-          printf '%s' "$ITEMS" > items.json
-          python runner.py items.json out
+          python runner.py "$RUNNER_TEMP/items.json" out
+          rm -f "$RUNNER_TEMP/items.json"
+      - name: 結果を包む
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          tar -czf "$RUNNER_TEMP/out.tgz" -C out .
+          mkdir -p enc && openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BUNDLE_KEY -in "$RUNNER_TEMP/out.tgz" -out "enc/$TAG.enc"
+          rm -rf out "$RUNNER_TEMP/out.tgz"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4（2026-10-29 時点の版に固定）
         with:
           name: ${{ inputs.tag }}
-          path: out/
+          path: enc/
           retention-days: 1

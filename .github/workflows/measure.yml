@@ -3,13 +3,13 @@ on:
   workflow_dispatch:
     inputs:
       items:
-        description: '[{"id": "...", "url": "..."}] の JSON'
+        description: '[{"id": "...", "url": "..."}] の JSON を BUNDLE_KEY（repo の秘密）で暗号化して base64 にした物。公開 repo の入力はログに出るので、暗号化せずに渡さない'
         required: true
       bundle:
         description: 道具の tar.gz を BUNDLE_KEY（repo の秘密）で暗号化して base64 にした物。公開 repo の入力は誰でも見られるので、暗号化せずに渡さない
         required: true
       tag:
-        description: 結果の名前
+        description: 結果の名前（英数字と _ - だけ）
         required: true
         default: measure
       shards:
@@ -23,10 +23,15 @@ on:
 permissions:
   contents: read
   actions: read
+# 2026-10-30 辛口点検：入力（調べる動画の URL）も結果（文字起こし・読み取り・コマ）も暗号にする。
+# 公開 repo のログと置き土産（artifact）は誰でも見られる＝何を調べているかも出さない。
+# 鍵は解く段と包む段にだけ渡し、外の動画を扱う段（yt-dlp・ffmpeg・Whisper）には渡さない。
 jobs:
   measure:
     runs-on: windows-latest
     timeout-minutes: 300
+    env:
+      TAG: ${{ inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -50,40 +55,62 @@ jobs:
           # 出方の測り（telop_motion）は ffprobe を使う。imageio-ffmpeg には ffprobe が無い（2回とも出方が全滅した）
           choco install ffmpeg -y --no-progress | Out-Null
           ffprobe -version | Select-Object -First 1
-      - name: 道具を戻す
+      - name: 道具と入力を戻す
         shell: bash
         env:
           BUNDLE: ${{ inputs.bundle }}
+          ITEMS: ${{ inputs.items }}
           BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
         run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || { echo "tag は英数字と _ - だけ"; exit 1; }
           printf '%s' "$BUNDLE" | base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -out bundle.tgz
           mkdir -p tools && tar -xzf bundle.tgz -C tools && rm bundle.tgz
+          printf '%s' "$ITEMS" | base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -out items.json
       - name: 前の走りの結果を読み込む
         if: ${{ inputs.prev_run != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           PREV_RUN: ${{ inputs.prev_run }}
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
         # 入力は命令の文に直に埋めない（環境変数で渡す＝入力に書いた命令が実行されない・2026-10-28 点検）
         run: |
           [[ "$PREV_RUN" =~ ^[0-9]+$ ]] || { echo "prev_run は数字だけ"; exit 1; }
           gh run download "$PREV_RUN" -R "$GITHUB_REPOSITORY" -D prevraw
-          mkdir -p prev && find prevraw -name '*.json' -exec cp {} prev/ \;
+          mkdir -p prev prevx
+          n=0
+          for f in $(find prevraw -name '*.enc'); do
+            n=$((n + 1)); mkdir -p "prevx/$n"
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BUNDLE_KEY -in "$f" | tar -xzf - -C "prevx/$n"
+          done
+          find prevx -name '*.json' -exec cp {} prev/ \;
+          rm -rf prevraw prevx
           ls prev | wc -l
       - name: 測る
         shell: pwsh
         env:
-          ITEMS: ${{ inputs.items }}
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ inputs.shards }}
           PYTHONIOENCODING: utf-8
         run: |
-          [IO.File]::WriteAllText("$PWD\items.json", $env:ITEMS)
           if ($env:SHARDS -notmatch '^[0-9]+$') { throw "shards は数字だけ" }
           python tools/runner/measure.py items.json out "$env:SHARD" "$env:SHARDS"
+      - name: 結果を包む
+        if: always()
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          rm -f items.json
+          [[ "$TAG" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || exit 1
+          mkdir -p out enc
+          tar -czf out.tgz -C out .
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BUNDLE_KEY -in out.tgz -out "enc/$TAG-$SHARD.enc"
+          rm -rf out out.tgz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4（2026-10-29 時点の版に固定）
         if: always()
         with:
           name: ${{ inputs.tag }}-${{ matrix.shard }}
-          path: out/
+          path: enc/
           retention-days: 1

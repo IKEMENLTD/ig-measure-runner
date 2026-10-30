@@ -18,6 +18,7 @@ FF = imageio_ffmpeg.get_ffmpeg_exe()  # apt-get が10分止まった（2026-10-2
 CW, CH, COLS, ROWS, LAB = 312, 554, 5, 2, 20  # 高さは偶数（555 だと JPEG の書き出しが -22 で落ちた）
 PER = COLS * ROWS
 MAXF = 30
+VID = __import__("re").compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # 取りに行ってよいホスト（https だけ）。何でも取れる作りにしない（自動のセキュリティ確認の指摘・2026-10-23）
@@ -67,12 +68,10 @@ def fetch(url, out):
         r = subprocess.run(["yt-dlp", "--no-warnings", "-f", "b[vcodec^=avc1]/bv*[vcodec^=avc1]/b[vcodec*=264]/b", "-S", "vcodec:h264", "--ffmpeg-location", FF, "-o", out.replace(".mp4", ".%(ext)s"), url], capture_output=True, text=True, timeout=300)
         # 取れた物は動画の入れ物だけを受け取る（自動のセキュリティ確認の指摘・2026-10-23）
         got = sorted(g for g in glob.glob(out.replace(".mp4", ".*")) if g.rsplit(".", 1)[-1] in ("mp4", "webm", "mkv"))
-        print("yt-dlp", r.returncode, r.stderr[-300:], [(g, os.path.getsize(g)) for g in got], flush=True)
-        lst = subprocess.run(["yt-dlp", "--no-warnings", "-F", url], capture_output=True, text=True, timeout=120).stdout
-        print("formats", lst[-1500:], flush=True)
         if not got:
             raise RuntimeError(r.stderr[-300:])
         out = got[0]
+    kind(out)  # 動画の入れ物でなければ、ここで落とす（後の ffmpeg に渡さない）
     return out
 
 
@@ -86,7 +85,6 @@ def probe(p):
     e = subprocess.run([FF, "-protocol_whitelist", "file", "-f", kind(p), "-i", p], capture_output=True, text=True).stderr
     m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", e)
     d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", e)
-    print("probe", [l.strip() for l in e.splitlines() if "Stream" in l][:3], flush=True)
     return {"w": int(m.group(1)) if m else None, "h": int(m.group(2)) if m else None,
             "duration": int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3)) if d else 0}
 
@@ -131,8 +129,10 @@ def main(items_p, out):
     os.makedirs("v", exist_ok=True)
     items = json.load(open(items_p, encoding="utf-8"))
     meta = {}
-    for it in items:
+    for k, it in enumerate(items, 1):
         vid, url = it["id"], it["url"]
+        if not VID.match(vid):
+            raise ValueError("id は英数字と _ - だけ（ファイルの名前に使う）")
         t0 = time.time()
         try:
             p = fetch(url, f"v/{vid}.mp4")
@@ -144,7 +144,8 @@ def main(items_p, out):
             info = {"error": str(e)[-300:]}
         meta[vid] = info
         time.sleep(4)  # 投稿のページから取る時に止められないよう間を空ける
-        print(vid, info, flush=True)
+        # 公開 repo のログは誰でも見られる＝何本目か・できたかだけ（URL・id・失敗の文は暗号にした結果の meta.json へ）
+        print(f"{k}/{len(items)}", "失敗" if "error" in info else "できた", flush=True)
     json.dump(meta, open(f"{out}/meta.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
